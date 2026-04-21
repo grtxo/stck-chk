@@ -51,6 +51,7 @@ class ProductStatus:
     price: str
     in_stock: bool
     detection_method: str  # which parsing method found the result
+    color: str = ""  # color variant (e.g. "black", "white"), empty if unknown
 
 
 # ─────────────────────────────────────────────────────────
@@ -98,26 +99,28 @@ def _detect_via_json_ld(soup: BeautifulSoup, url: str) -> ProductStatus | None:
     return None
 
 
-def _detect_via_next_data(soup: BeautifulSoup, url: str) -> ProductStatus | None:
+def _detect_via_next_data(soup: BeautifulSoup, url: str) -> list[ProductStatus]:
     """Try to extract stock status from Next.js __NEXT_DATA__ JSON.
 
-    Sonos uses this structure:
-      props.pageProps.product.inventory.orderable  → bool (primary signal)
-      props.pageProps.product.inventory.stockLevel → int
-      props.pageProps.product.name                 → str
-      props.pageProps.product.price                → int (EUR)
-      props.pageProps.product.currency              → str ("EUR")
+    Returns one ProductStatus per color variant so that the caller can
+    filter by desired color.  If no color variants are found, returns a
+    single ProductStatus for the master product.
+
+    Sonos data paths used:
+      variationAttributes[].values[]  → {value, name, orderable}
+      variants[]                      → {variationValues.color, orderable}
+      c_expandedVariants[]            → full variant with inventory + variationValues.color
+      inventory                       → master-level inventory (fallback)
     """
     script = soup.find("script", id="__NEXT_DATA__")
     if not script or not script.string:
-        return None
+        return []
 
     try:
         data = json.loads(script.string)
     except (json.JSONDecodeError, TypeError):
-        return None
+        return []
 
-    in_stock = None
     name = "Unknown Product"
     price = "?"
 
@@ -126,47 +129,90 @@ def _detect_via_next_data(soup: BeautifulSoup, url: str) -> ProductStatus | None
         product_data = page_props.get("product", {})
 
         if not product_data:
-            return None
+            return []
 
         name = product_data.get("name", name)
 
-        # Price — simple integer in EUR on the German store
+        # Price — check for sale price first, then regular price
         price_val = product_data.get("price")
         currency = product_data.get("currency", "EUR")
         if price_val is not None:
             price = f"{price_val} {currency}"
 
-        # Primary signal: inventory.orderable
+        # ── Try to get per-variant stock status ──────────────────
+        results: list[ProductStatus] = []
+
+        # Method A: variationAttributes (quick — has orderable per color)
+        variation_attrs = product_data.get("variationAttributes", [])
+        color_attr = None
+        for attr in variation_attrs:
+            if attr.get("id") == "color":
+                color_attr = attr
+                break
+
+        if color_attr and color_attr.get("values"):
+            # Try to get per-variant sale prices from c_expandedVariants
+            variant_prices: dict[str, str] = {}
+            expanded = product_data.get("c_expandedVariants", [])
+            if isinstance(expanded, str):
+                try:
+                    expanded = json.loads(expanded)
+                except (json.JSONDecodeError, TypeError):
+                    expanded = []
+            for ev in (expanded if isinstance(expanded, list) else []):
+                ev_color = ev.get("variationValues", {}).get("color", "")
+                # Prefer promotional/sale price
+                sale = ev.get("c_salePrice")
+                promos = ev.get("productPromotions", [])
+                if sale:
+                    variant_prices[ev_color] = f"{sale} {ev.get('currency', currency)}"
+                elif promos:
+                    promo_price = promos[0].get("promotionalPrice")
+                    if promo_price:
+                        variant_prices[ev_color] = f"{promo_price} {ev.get('currency', currency)}"
+
+            for color_val in color_attr["values"]:
+                c_value = color_val.get("value", "")   # e.g. "black"
+                c_name = color_val.get("name", "")     # e.g. "Schwarz"
+                c_orderable = color_val.get("orderable", False)
+                c_price = variant_prices.get(c_value, price)
+
+                log.info(
+                    "  variant color=%s (%s): orderable=%s",
+                    c_value, c_name, c_orderable,
+                )
+                results.append(ProductStatus(
+                    url=url,
+                    name=name,
+                    price=c_price,
+                    in_stock=c_orderable,
+                    detection_method="__NEXT_DATA__",
+                    color=c_value,
+                ))
+            return results
+
+        # ── Fallback: no color variants — use master inventory ───
         inventory = product_data.get("inventory", {})
         if inventory:
             in_stock = inventory.get("orderable", False)
-            stock_level = inventory.get("stockLevel", 0)
             log.info(
                 "  inventory: orderable=%s, stockLevel=%s, ats=%s",
                 inventory.get("orderable"),
-                stock_level,
+                inventory.get("stockLevel", 0),
                 inventory.get("ats"),
             )
-        # Fallback: check variants for orderable inventory
-        elif "variants" in product_data:
-            variants = product_data["variants"]
-            if isinstance(variants, list):
-                in_stock = any(
-                    v.get("inventory", {}).get("orderable", False)
-                    for v in variants
-                )
+            return [ProductStatus(
+                url=url,
+                name=name,
+                price=price,
+                in_stock=in_stock,
+                detection_method="__NEXT_DATA__",
+            )]
+
     except (AttributeError, TypeError, KeyError):
         pass
 
-    if in_stock is not None:
-        return ProductStatus(
-            url=url,
-            name=name,
-            price=price,
-            in_stock=in_stock,
-            detection_method="__NEXT_DATA__",
-        )
-    return None
+    return []
 
 
 def _detect_via_button_text(soup: BeautifulSoup, url: str) -> ProductStatus | None:
@@ -231,41 +277,50 @@ def _detect_via_button_text(soup: BeautifulSoup, url: str) -> ProductStatus | No
     )
 
 
-def check_product(url: str) -> ProductStatus:
+def check_product(url: str) -> list[ProductStatus]:
     """
     Check stock status for a single Sonos product URL.
+
+    Returns a list of ProductStatus — one per color variant if the product
+    has color options, or a single entry if it doesn't.
 
     Tries multiple detection methods in order of reliability.
     """
     html = fetch_page(url)
     soup = BeautifulSoup(html, "html.parser")
 
-    # Method 1: JSON-LD structured data (most reliable)
+    # Method 1: __NEXT_DATA__ (best source — has per-variant color data)
+    results = _detect_via_next_data(soup, url)
+    if results:
+        for r in results:
+            color_info = f" [{r.color}]" if r.color else ""
+            log.info(
+                "[NEXT]     %s%s — %s",
+                r.name, color_info,
+                "IN STOCK ✅" if r.in_stock else "out of stock ❌",
+            )
+        return results
+
+    # Method 2: JSON-LD structured data (no per-variant color info)
     result = _detect_via_json_ld(soup, url)
     if result:
         log.info("[JSON-LD]  %s — %s", result.name, "IN STOCK ✅" if result.in_stock else "out of stock ❌")
-        return result
-
-    # Method 2: __NEXT_DATA__ (Next.js page data)
-    result = _detect_via_next_data(soup, url)
-    if result:
-        log.info("[NEXT]     %s — %s", result.name, "IN STOCK ✅" if result.in_stock else "out of stock ❌")
-        return result
+        return [result]
 
     # Method 3: Button text / page content (fallback)
     result = _detect_via_button_text(soup, url)
     if result:
         log.info("[BUTTON]   %s — %s", result.name, "IN STOCK ✅" if result.in_stock else "out of stock ❌")
-        return result
+        return [result]
 
     # Should never reach here since button-text always returns something
-    return ProductStatus(
+    return [ProductStatus(
         url=url,
         name="Unknown Product",
         price="?",
         in_stock=False,
         detection_method="none",
-    )
+    )]
 
 
 # ─────────────────────────────────────────────────────────
@@ -285,10 +340,11 @@ def send_notification(products: list[ProductStatus]) -> None:
     # Build HTML email body
     product_rows = ""
     for p in products:
+        color_label = f' <span style="color: #666;">({p.color.capitalize()})</span>' if p.color else ""
         product_rows += f"""
         <tr>
             <td style="padding: 12px 16px; border-bottom: 1px solid #eee;">
-                <strong>{p.name}</strong>
+                <strong>{p.name}</strong>{color_label}
             </td>
             <td style="padding: 12px 16px; border-bottom: 1px solid #eee;">
                 {p.price}
@@ -333,7 +389,8 @@ def send_notification(products: list[ProductStatus]) -> None:
 
     plain_body = "Sonos Warehouse Deal Alert!\n\n"
     for p in products:
-        plain_body += f"✅ {p.name} — {p.price}\n   {p.url}\n\n"
+        color_info = f" ({p.color.capitalize()})" if p.color else ""
+        plain_body += f"✅ {p.name}{color_info} — {p.price}\n   {p.url}\n\n"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -359,39 +416,65 @@ def send_notification(products: list[ProductStatus]) -> None:
 # ─────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────
+def _matches_color_filter(status: ProductStatus) -> bool:
+    """Check if a product status matches the configured color filter.
+
+    Returns True if:
+      - No color filter is configured (DESIRED_COLORS is empty), OR
+      - The product has no color info (single-variant product), OR
+      - The product's color matches one of the desired colors.
+    """
+    if not config.DESIRED_COLORS:
+        return True  # no filter — accept everything
+    if not status.color:
+        return True  # no color info — can't filter, accept it
+    return status.color.lower() in config.DESIRED_COLORS
+
+
 def run_check() -> list[ProductStatus]:
     """Run a single stock check across all configured product URLs."""
     log.info("=" * 60)
     log.info("Starting stock check for %d product(s)", len(config.PRODUCT_URLS))
+    if config.DESIRED_COLORS:
+        log.info("Color filter: %s", ", ".join(config.DESIRED_COLORS))
     log.info("=" * 60)
 
     results: list[ProductStatus] = []
     for url in config.PRODUCT_URLS:
         try:
-            status = check_product(url)
-            results.append(status)
+            statuses = check_product(url)
+            results.extend(statuses)
         except requests.RequestException as e:
             log.error("Failed to check %s: %s", url, e)
         except Exception as e:
             log.error("Unexpected error checking %s: %s", url, e)
 
-    in_stock = [r for r in results if r.in_stock]
+    # Apply color filter
+    in_stock_all = [r for r in results if r.in_stock]
+    in_stock = [r for r in in_stock_all if _matches_color_filter(r)]
+    filtered_out = len(in_stock_all) - len(in_stock)
 
     log.info("-" * 60)
     log.info(
-        "Summary: %d checked, %d in stock, %d out of stock",
+        "Summary: %d variant(s) checked, %d in stock, %d out of stock",
         len(results),
-        len(in_stock),
-        len(results) - len(in_stock),
+        len(in_stock_all),
+        len(results) - len(in_stock_all),
     )
+    if filtered_out:
+        log.info(
+            "  ↳ %d in-stock variant(s) filtered out (wrong color)",
+            filtered_out,
+        )
 
     if in_stock:
-        log.info("🎉 Products in stock:")
+        log.info("🎉 Products in stock (matching color filter):")
         for p in in_stock:
-            log.info("   ✅ %s — %s — %s", p.name, p.price, p.url)
+            color_info = f" [{p.color}]" if p.color else ""
+            log.info("   ✅ %s%s — %s — %s", p.name, color_info, p.price, p.url)
         send_notification(in_stock)
     else:
-        log.info("No products in stock right now.")
+        log.info("No products in stock right now (matching your filters).")
 
     return results
 

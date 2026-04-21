@@ -28,6 +28,24 @@ PRODUCT_URLS: list[str] = json.loads(
 
 
 # ─────────────────────────────────────────────────────────
+# Color filter (optional)
+# ─────────────────────────────────────────────────────────
+# Set SONOS_DESIRED_COLORS as a JSON array of color values to filter on.
+# Only variants matching one of these colors will trigger a notification.
+# Use the English color names from the Sonos website (lowercase), e.g.:
+#   ["black"]
+#   ["black", "white"]
+#
+# Leave empty [] or unset to be notified about ANY available color.
+
+DESIRED_COLORS: list[str] = [
+    c.lower() for c in json.loads(
+        os.environ.get("SONOS_DESIRED_COLORS", "[]")
+    )
+]
+
+
+# ─────────────────────────────────────────────────────────
 # Email settings  (Gmail SMTP)
 # ─────────────────────────────────────────────────────────
 # GMAIL_ADDRESS  – your full Gmail address (sender + default recipient)

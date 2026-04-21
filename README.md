@@ -150,6 +150,32 @@ Now tell the checker which products to monitor.
 
 Alternatively, you can edit the `_default_urls` list directly in `config.py` if you prefer.
 
+### Step 6b: Filter by Color (Optional)
+
+By default, the checker alerts you when **any** color variant comes in stock. If you only want a specific color, set up a color filter:
+
+1. Still on the **Variables** tab (from Step 6), click **New repository variable**
+2. Set:
+   - **Name**: `SONOS_DESIRED_COLORS`
+   - **Value**: A JSON array of color values (use English, lowercase), for example:
+     ```json
+     ["black"]
+     ```
+     To accept multiple colors:
+     ```json
+     ["black", "white"]
+     ```
+3. Click **Add variable**
+
+Available colors depend on the product. Common values are:
+
+| Color | Value |
+|:---|:---|
+| Schwarz (Black) | `black` |
+| Weiß (White) | `white` |
+
+> 💡 If you leave `SONOS_DESIRED_COLORS` empty or don't create it at all, you'll be notified about **all** colors — the old behaviour.
+
 ### Step 7: Enable GitHub Actions
 
 GitHub Actions should be enabled by default, but verify:
